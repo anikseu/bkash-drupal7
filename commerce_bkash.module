@@ -1,0 +1,431 @@
+<?php
+
+/**
+ * Implements hook_menu().
+ */
+function commerce_bkash_menu()
+{
+  $items['commerce_bkash/ipn'] = [
+    'page callback' => 'commerce_bkash_ipn_process',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  ];
+
+  return $items;
+}
+
+/**
+ * Implements hook_commerce_payment_method_info().
+ */
+function commerce_bkash_commerce_payment_method_info()
+{
+  $payment_methods = [];
+
+  $payment_methods['commerce_bkash'] = [
+    'base' => 'commerce_bkash',
+    'title' => t('bkash'),
+    'short_title' => t('bkash'),
+    'description' => t('bkash payment service'),
+    'terminal' => FALSE,
+    'offsite' => TRUE,
+    'offsite_autoredirect' => TRUE,
+  ];
+
+  return $payment_methods;
+}
+
+/**
+ * Payment method callback: settings form.
+ */
+function commerce_bkash_settings_form($settings = [])
+{
+  $form = [];
+
+  $form['environment'] = [
+    '#type' => 'select',
+    '#title' => t('Environment'),
+    '#options' => ['live' => 'Live', 'sandbox' => 'Sandbox'],
+    '#default_value' => !empty($settings['environment']) ? $settings['environment'] : 'live',
+    '#required' => TRUE,
+  ];
+
+  $form['store_username'] = [
+    '#type' => 'textfield',
+    '#title' => t('bKash Username'),
+    '#default_value' => !empty($settings['store_username']) ? $settings['store_username'] : '',
+    '#required' => TRUE,
+  ];
+
+  $form['store_password'] = [
+    '#type' => 'textfield',
+    '#title' => t('bKash Password'),
+    '#default_value' => !empty($settings['store_password']) ? $settings['store_password'] : '',
+    '#required' => TRUE,
+  ];
+
+
+  $form['store_app_key'] = [
+    '#type' => 'textfield',
+    '#title' => t('bKash App Key'),
+    '#default_value' => !empty($settings['store_app_key']) ? $settings['store_app_key'] : '',
+    '#required' => TRUE,
+  ];
+
+  $form['store_app_secret'] = [
+    '#type' => 'textfield',
+    '#title' => t('bKash App Secret'),
+    '#default_value' => !empty($settings['store_app_secret']) ? $settings['store_app_secret'] : '',
+    '#required' => TRUE,
+  ];
+
+
+  $form['show_payment_instructions'] = [
+    '#type' => 'checkbox',
+    '#title' => t('Show a message on the checkout form when bkash is selected telling the customer to "Continue with checkout to complete payment via bkash."'),
+    '#default_value' => !empty($settings['show_payment_instructions']) ? $settings['show_payment_instructions'] : 0,
+  ];
+
+
+  return $form;
+}
+
+/**
+ * Payment method callback: adds a message to the submission form if enabled in
+ * the payment method settings.
+ */
+function commerce_bkash_submit_form($payment_method, $pane_values, $checkout_pane, $order)
+{
+  $form = [];
+
+  if (!empty($payment_method['settings']['show_payment_instructions'])) {
+    $form['commerce_bkash_information'] = [
+      '#markup' => '<span class="commerce-bkash-info">' . t('(Continue with checkout to complete payment via bkash.)') . '</span>',
+    ];
+  }
+
+  return $form;
+}
+
+/**
+ * Payment method callback: redirect form, a wrapper around the module's general
+ *   use function for building a WPS form.
+ */
+function commerce_bkash_redirect_form($form, &$form_state, $order, $payment_method)
+{
+  // Return an error if the enabling action's settings haven't been configured.
+  if (
+    empty($payment_method['settings']['store_username']) ||
+    empty($payment_method['settings']['store_password']) ||
+    empty($payment_method['settings']['store_app_key']) ||
+    empty($payment_method['settings']['store_app_secret'])
+  ) {
+    drupal_set_message(t('bkash is not configured for use.'), 'error');
+    return [];
+  }
+
+  $settings = [
+    'cancel' => url('checkout/' . $order->order_id . '/payment/back/' . $order->data['payment_redirect_key'], ['absolute' => TRUE]),
+    'success' => url('checkout/' . $order->order_id . '/payment/return/' . $order->data['payment_redirect_key'], ['absolute' => TRUE]),
+    'ipn' => url('commerce_bkash/ipn', ['absolute' => TRUE]),
+    'payment_method' => $payment_method['instance_id'],
+  ];
+
+  return commerce_bkash_order_form($form, $form_state, $order, $payment_method['settings'] + $settings);
+}
+
+function bKash_api_call($request_url, $header, $post_data)
+{
+  $url = curl_init($request_url);
+
+  curl_setopt($url, CURLOPT_HTTPHEADER, $header);
+  curl_setopt($url, CURLOPT_CUSTOMREQUEST, "POST");
+  curl_setopt($url, CURLOPT_RETURNTRANSFER, true);
+  curl_setopt($url, CURLOPT_POSTFIELDS, json_encode($post_data));
+  curl_setopt($url, CURLOPT_FOLLOWLOCATION, 1);
+  $result_data = curl_exec($url);
+  curl_close($url);
+
+  return $result_data;
+}
+
+/**
+ * Payment method callback: redirect form return validation.
+ */
+function commerce_bkash_redirect_form_validate($order, $payment_method)
+{
+  // check for status
+  if (empty($_GET['status']) || empty($_GET['paymentID'])) {
+    drupal_set_message(t('Payment transaction has failed'), 'error');
+    return FALSE;
+  }
+
+  // read settings for this module
+  $settings = $payment_method['settings'];
+
+  // endpoint for bkash execute payment
+  $endpoint_url = 'https://tokenized.sandbox.bka.sh/v1.2.0-beta';
+
+  if ($settings['environment'] == 'live') {
+    $endpoint_url = 'https://tokenized.pay.bka.sh/v1.2.0-beta';
+  }
+
+
+  // set header for executing  payment
+  $header = array(
+    'Content-Type:application/json',
+    'Authorization: ' . $_SESSION['id_token'],
+    'X-APP-Key: ' . $settings['store_app_key'],
+  );
+
+  // set post data for executing payment
+  $post_data = array(
+    'paymentID' => $_GET['paymentID'],
+  );
+
+  // execute payment in bKash
+  $request_url = "$endpoint_url/tokenized/checkout/execute";
+  $result_data = bKash_api_call($request_url, $header, $post_data);
+
+  if (is_null($result_data)) {
+    //sleep for 1 sec
+    sleep(1);
+
+    // query for the payment status
+    $request_url = "$endpoint_url/tokenized/checkout/payment/query";
+    $result_data = bKash_api_call($request_url, $header, $post_data);
+  }
+
+  // log result data if sandbox mode is enabled
+  if ($settings['environment'] == 'sandbox') {
+    watchdog('commerce_bkash', 'bkash response: @executePayment', ['@executePayment' => print_r(($result_data), true)], WATCHDOG_INFO);
+  }
+
+  $result_data = json_decode($result_data, true);
+
+
+  // check if transactionStatus is Completed
+  if (empty($result_data['transactionStatus']) || $result_data['transactionStatus'] != 'Completed') {
+    drupal_set_message(t('Payment transaction has failed'), 'error');
+    return FALSE;
+  }
+
+
+  if (!$result_data) {
+    drupal_set_message(t('Payment transaction has failed'), 'error');
+    return FALSE;
+  }
+
+
+  if (!empty($_GET['status']) && $_GET['status'] != 'success') {
+    drupal_set_message(t('Payment transaction has failed'), 'error');
+    return FALSE;
+  }
+
+  // call the transaction process (store record to transactions)
+  commerce_bkash_ipn_process($result_data);
+
+  return TRUE;
+}
+
+
+/**
+ * Payment method callback: redirect form back.
+ */
+function commerce_bkash_redirect_form_back($order, $payment_method)
+{
+  commerce_order_delete($order->order_id);
+  drupal_goto('/');
+  exit;
+}
+
+/**
+ * Processes an incoming IPN.
+ */
+function commerce_bkash_ipn_process($response_data)
+{
+
+  // get query params status
+  $status = $_GET['status'];
+  $order_id = $_GET['order_id'];
+
+  $order = commerce_order_load($order_id);
+
+  if (empty($order)) {
+    watchdog('commerce_bkash', 'IPN URL accessed with invalid order id.', [], WATCHDOG_WARNING);
+    return FALSE;
+  }
+
+  $payment_method = commerce_payment_method_instance_load($order->data['payment_method']);
+
+  // Process with transaction.
+  $remote_id = isset($_GET['paymentID']) ? $_GET['paymentID'] : 0;
+  $transactions = commerce_payment_transaction_load_multiple([], ['remote_id' => $remote_id]);
+  if (!empty($transactions)) {
+    $transaction = reset($transactions);
+  } else {
+    $transaction = commerce_payment_transaction_new($payment_method['method_id'], $order->order_id);
+    $transaction->instance_id = $payment_method['instance_id'];
+  }
+
+  $transaction->amount = commerce_currency_decimal_to_amount($order->amount, $order->currency_code);
+  $transaction->currency_code = 'BDT';
+
+  $transaction->remote_id = isset($_GET['paymentID']) ? $_GET['paymentID'] : 0;
+  $transaction->remote_status = $response_data['transactionStatus'];
+  $transaction->payload['ipn'] = json_encode($response_data);
+
+
+  switch ($status) {
+    case 'success':
+      $transaction->status = COMMERCE_PAYMENT_STATUS_SUCCESS;
+      $transaction->message = t('The payment has completed.');
+      break;
+
+    default:
+      $transaction->status = COMMERCE_PAYMENT_STATUS_FAILURE;
+      $transaction->message = t('Payment has failed for the order.');
+      break;
+  }
+
+  commerce_payment_transaction_save($transaction);
+}
+
+/**
+ * Validate inp request.
+ */
+function commerce_bkash_ipn_validate($order, $payment_method, $data)
+{
+  return TRUE;
+}
+
+function getBkashToken($settings, $checkout_url)
+{
+  $_SESSION['id_token'] = null;
+
+  $post_token = array(
+    'app_key' => $settings['store_app_key'],
+    'app_secret' => $settings['store_app_secret']
+  );
+
+  $request_url = "$checkout_url/tokenized/checkout/token/grant";
+
+  $url = curl_init("$checkout_url/tokenized/checkout/token/grant");
+
+  $username = $settings['store_username'];
+  $password = $settings['store_password'];
+
+  $header = array(
+    'Content-Type:application/json',
+    "password:$password",
+    "username:$username"
+  );
+
+
+  $result_data = bKash_api_call($request_url, $header, $post_token);
+
+  $response = json_decode($result_data, true);
+
+  if (array_key_exists('msg', $response)) {
+    return json_encode($response);
+  }
+
+  $_SESSION['id_token'] = $response['id_token'];
+
+  return json_encode($response);
+}
+
+/**
+ * Builds a Website Payments Standard form from an order object.
+ */
+function commerce_bkash_order_form($form, &$form_state, $order, $settings)
+{
+  // Ensure a default value for the payment_method setting.
+  $settings += array('payment_method' => '');
+
+  $wrapper = entity_metadata_wrapper('commerce_order', $order);
+
+  $amount = $wrapper->commerce_order_total->amount->value();
+
+  $currency = $wrapper->commerce_order_total->currency_code->value();
+  $line_items = $wrapper->commerce_line_items->value();
+
+  $products = [];
+  foreach ($line_items as $line_item) {
+    if ($line_item->type == 'product' && !empty($line_item->commerce_product)) {
+      $line_item_wrapper = entity_metadata_wrapper('commerce_line_item', $line_item);
+      $products[] = $line_item_wrapper->commerce_product->title->value();
+    }
+  }
+
+
+  $checkout_url = 'https://tokenized.sandbox.bka.sh/v1.2.0-beta';
+
+  if ($settings['environment'] == 'live') {
+    $checkout_url = 'https://tokenized.pay.bka.sh/v1.2.0-beta';
+  }
+
+
+  // generate bkash auth token for checkout url.
+  getBkashToken($settings, $checkout_url);
+
+
+  // create bkash payment
+  $bkash_payment_data = array(
+    'mode' => '0011',
+    'amount' => number_format(commerce_currency_amount_to_decimal($amount, $currency), 2, '.', ''),
+    'currency' => $currency,
+    'intent' => 'sale',
+    'merchantInvoiceNumber' => $order->order_number,
+    'payerReference' => 'order_' . $order->order_number,
+    'callbackURL' => $settings['success'] . '/?' . http_build_query(['order_id' => $order->order_id]),
+  );
+
+  $request_url = "$checkout_url/tokenized/checkout/create";
+
+  $header = array(
+    'Content-Type:application/json',
+    'Authorization: ' . $_SESSION['id_token'],
+    'X-APP-Key: ' . $settings['store_app_key'],
+  );
+
+  $result_data = bKash_api_call($request_url, $header, $bkash_payment_data);
+
+  $response = json_decode($result_data, true);
+
+  // log response if sandbox mode is enabled
+  if ($settings['environment'] == 'sandbox') {
+    watchdog('commerce_bkash', 'bkash response: @createPayment', ['@createPayment' => print_r(json_encode($response), true)], WATCHDOG_INFO);
+  }
+
+  if (empty($response['bkashURL'])) {
+    return [];
+  }
+
+  $form['#action'] = $response['bkashURL'];
+  $form['#method'] = 'get';
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Proceed to bkash'),
+  );
+
+  // Redirect to bkash
+  drupal_goto($response['bkashURL']);
+
+  return $form;
+}
+
+/**
+ * Implementation of hook_form_commerce_checkout_form_alter().
+ */
+function commerce_bkash_form_commerce_checkout_form_alter(&$form, &$form_state)
+{
+  if (!empty($form['commerce_payment']['payment_method']['#options'])) {
+    foreach ($form['commerce_payment']['payment_method']['#options'] as $key => &$value) {
+      list($method_id, $rule_name) = explode('|', $key);
+      if ($method_id == 'commerce_bkash') {
+        $value = '<img src="' . url(drupal_get_path('module', 'commerce_bkash') . '/commerce_bkash.png', ['absolute' => true]) . '" alt="bkash">';
+      }
+    }
+  }
+}
